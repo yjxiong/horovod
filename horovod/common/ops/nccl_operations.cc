@@ -146,6 +146,141 @@ void NCCLAllreduce::PopulateNCCLCommStrategy(int& nccl_rank, int& nccl_size,
   nccl_id_bcast_comm = Communicator::GLOBAL;
 }
 
+// NCCL AllGather
+
+Status NCCLAllgather::Execute(std::vector<TensorTableEntry>& entries,
+                              const Response& response) {
+  auto& timeline = global_state_->timeline;
+  auto& first_entry = entries[0];
+
+  LOG(TRACE)<<"Start NCCL All Gather";
+
+  InitCUDA(entries);
+  InitNCCLComm(entries, response.devices());
+  InitCUDAQueue(entries, response);
+
+  // Sizes of subcomponents of each entry from all ranks
+  auto** entry_component_sizes = new int64_t* [entries.size()];
+
+  // Offset of each subcomponent of every entry in the final buffer after
+  // allgatherv
+  auto** entry_component_offsets = new int64_t* [entries.size()];
+
+  int global_size = global_state_->controller->GetSize();
+  auto* recvcounts = new int[global_size]();
+  auto* displcmnts = new int[global_size]();
+
+  for (size_t ec = 0; ec < entries.size(); ++ec) {
+    entry_component_sizes[ec] = new int64_t[global_size]();
+    entry_component_offsets[ec] = new int64_t[global_size]();
+  }
+
+
+  Status status = AllocateOutput(entries, response, entry_component_sizes, recvcounts);
+  if (global_state_->timeline.Initialized()) {
+      cuda_context_->RecordEvent(event_queue_, ALLOCATE_OUTPUT, *stream_);
+  }
+  if (!status.ok()) {
+    return status;
+  }
+
+  LOG(TRACE)<<"Output shape: "<<first_entry.output->shape().DebugString();
+
+  SetDisplacements(recvcounts, displcmnts);
+  SetEntryComponentOffsets(entries, entry_component_sizes, recvcounts, entry_component_offsets);
+
+  int element_size = GetNCCLDataType(first_entry.tensor);
+
+  const void* sendbuf = nullptr;
+  void* buffer_data;
+  int64_t total_num_elements = NumElements(entries);
+
+  // Copy memory into the fusion buffer.
+  if (entries.size() > 1) {
+    MemcpyInFusionBuffer(entries, displcmnts, element_size, buffer_data);
+    if (global_state_->timeline.Initialized()) {
+      cuda_context_->RecordEvent(event_queue_, MEMCPY_IN_FUSION_BUFFER, *stream_);
+    }
+  } else {
+    sendbuf = first_entry.tensor->data();
+    buffer_data = (void*) first_entry.output->data();
+  }
+
+  // Perform NCCL Allgather
+  auto nccl_result = ncclAllGather(sendbuf, buffer_data,
+                                   (size_t) total_num_elements,
+                                   GetNCCLDataType(first_entry.tensor), 
+                                   *nccl_comm_, *stream_);
+  nccl_context_->ErrorCheck("ncclAllGather", nccl_result);
+  LOG(TRACE)<<"NCCL results: "<<nccl_result;
+
+  if (global_state_->timeline.Initialized()) {
+    cuda_context_->RecordEvent(event_queue_, NCCL_ALLGATHER, *stream_);
+  }
+
+  if (entries.size() > 1) {
+    MemcpyOutFusionBuffer(entry_component_offsets, entry_component_sizes,
+                          buffer_data, element_size, entries);
+    if (global_state_->timeline.Initialized()) {
+      cuda_context_->RecordEvent(event_queue_, MEMCPY_OUT_FUSION_BUFFER, *stream_);
+    }
+  }
+
+  delete[] recvcounts;
+  delete[] displcmnts;
+
+  for (size_t ec = 0; ec < entries.size(); ++ec) {
+    delete[] entry_component_sizes[ec];
+    delete[] entry_component_offsets[ec];
+  }
+  delete[] entry_component_sizes;
+  delete[] entry_component_offsets;
+
+  return FinalizeCUDAQueue(entries);
+}
+
+void NCCLAllgather::InitNCCLComm(const std::vector<TensorTableEntry>& entries,
+                                 const std::vector<int32_t>& nccl_device_map) {
+  // Ensure NCCL communicator is in the map before executing reduction.
+  ncclComm_t& nccl_comm = nccl_context_->nccl_comms[global_state_->current_nccl_stream][nccl_device_map];
+  if (nccl_comm == nullptr) {
+    auto& timeline = global_state_->timeline;
+    timeline.ActivityStartAll(entries, INIT_NCCL);
+
+    int nccl_rank, nccl_size;
+    Communicator nccl_id_bcast_comm;
+    PopulateNCCLCommStrategy(nccl_rank, nccl_size, nccl_id_bcast_comm);
+
+    ncclUniqueId nccl_id;
+    if (nccl_rank == 0) {
+      nccl_context_->ErrorCheck("ncclGetUniqueId", ncclGetUniqueId(&nccl_id));
+    }
+
+    global_state_->controller->Bcast((void*)&nccl_id, sizeof(nccl_id), 0,
+                                     nccl_id_bcast_comm);
+
+    ncclComm_t new_nccl_comm;
+    auto nccl_result = ncclCommInitRank(&new_nccl_comm, nccl_size, nccl_id, nccl_rank);
+    nccl_context_->ErrorCheck("ncclCommInitRank", nccl_result);
+    nccl_comm = new_nccl_comm;
+
+    // Barrier helps NCCL to synchronize after initialization and avoid
+    // deadlock that we've been seeing without it.
+    global_state_->controller->Barrier(Communicator::GLOBAL);
+
+    timeline.ActivityEndAll(entries);
+  }
+
+  nccl_comm_ = &nccl_comm;
+}
+
+void NCCLAllgather::PopulateNCCLCommStrategy(int& nccl_rank, int& nccl_size,
+                                             Communicator& nccl_id_bcast_comm) {
+  nccl_rank = global_state_->controller->GetRank();
+  nccl_size = global_state_->controller->GetSize();
+  nccl_id_bcast_comm = Communicator::GLOBAL;
+}
+
 #if HAVE_MPI
 Status
 NCCLHierarchicalAllreduce::Execute(std::vector<TensorTableEntry>& entries,

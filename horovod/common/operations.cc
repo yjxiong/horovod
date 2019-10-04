@@ -157,8 +157,14 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
     allreduce_ops.push_back(std::shared_ptr<AllreduceOp>(
         new DDLAllreduce(&ddl_context, &cuda_context, &state)));
 #endif
+
+  #if HAVE_NCCL && HOROVOD_GPU_ALLGATHER == 'N'
+    allgather_ops.push_back(std::shared_ptr<AllgatherOp>(
+        new NCCLAllgather(&nccl_context, &cuda_context, &state)));
+  #else
     allgather_ops.push_back(std::shared_ptr<AllgatherOp>(
         new MPIHierarchicalAllgather(&mpi_context, &state)));
+  #endif
   }
 #endif
 
@@ -166,6 +172,13 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
   allreduce_ops.push_back(std::shared_ptr<AllreduceOp>(
       new NCCLAllreduce(&nccl_context, &cuda_context, &state)));
 #endif
+
+#if HAVE_NCCL && HOROVOD_GPU_ALLGATHER == 'N'
+  allgather_ops.push_back(std::shared_ptr<AllgatherOp>(
+      new NCCLAllgather(&nccl_context, &cuda_context, &state)));
+#endif
+
+
 
 #if HAVE_GLOO
   if (gloo_context.IsEnabled()) {

@@ -582,9 +582,9 @@ def get_common_options(build_ext):
                              'values are "", "MPI", "NCCL", "DDL".' % gpu_allreduce)
 
     gpu_allgather = os.environ.get('HOROVOD_GPU_ALLGATHER')
-    if gpu_allgather and gpu_allgather != 'MPI':
+    if gpu_allgather and gpu_allgather != 'MPI' and gpu_allgather != "NCCL":
         raise DistutilsError('HOROVOD_GPU_ALLGATHER=%s is invalid, supported '
-                             'values are "", "MPI".' % gpu_allgather)
+                             'values are "", "NCCL", "MPI".' % gpu_allgather)
 
     gpu_broadcast = os.environ.get('HOROVOD_GPU_BROADCAST')
     if gpu_broadcast and gpu_broadcast != 'MPI':
@@ -598,7 +598,7 @@ def get_common_options(build_ext):
         have_cuda = False
         cuda_include_dirs = cuda_lib_dirs = []
 
-    if gpu_allreduce == 'NCCL':
+    if gpu_allreduce == 'NCCL' or gpu_allgather == 'NCCL':
         have_nccl = True
         nccl_include_dirs, nccl_lib_dirs, nccl_libs = get_nccl_vals(
             build_ext, cuda_include_dirs, cuda_lib_dirs, cpp_flags)

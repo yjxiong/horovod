@@ -187,5 +187,129 @@ Status CUDAAllreduce::FinalizeCUDAQueue(const std::vector<TensorTableEntry>& ent
   return Status::InProgress();
 }
 
+// All Gather Op
+CUDAAllgather::CUDAAllgather(CUDAContext* context,
+                             HorovodGlobalState* global_state)
+    : AllgatherOp(global_state), cuda_context_(context) {}
+
+bool CUDAAllgather::Enabled(const ParameterManager& param_manager,
+                            const std::vector<TensorTableEntry>& entries,
+                            const Response& response) const {
+  return entries[0].device != CPU_DEVICE_ID;
+}
+
+void CUDAAllgather::MemcpyInFusionBuffer(const std::vector<TensorTableEntry>& entries,
+                       const int* displcmnts, int element_size,
+                       void*& buffer_data) {
+  // Access the fusion buffer.
+  auto& first_entry = entries[0];
+  auto buffer = global_state_->fusion_buffer.GetBuffer(
+      first_entry.device, first_entry.context->framework(), global_state_->current_nccl_stream);
+  buffer_data = const_cast<void*>(buffer->AccessData(first_entry.context));
+
+  int64_t offset = displcmnts[global_state_->controller->GetRank()] * element_size;
+  for (auto& e : entries) {
+    void* buffer_data_at_offset = (uint8_t*)buffer_data + offset;
+    std::memcpy(buffer_data_at_offset, e.tensor->data(),
+                (size_t)e.tensor->size());
+    auto cuda_result = cudaMemcpyAsync(buffer_data_at_offset, e.tensor->data(),
+                                     (size_t) e.tensor->size(), cudaMemcpyDeviceToDevice,
+                                     cuda_context_->streams[global_state_->current_nccl_stream][first_entry.device]);
+    cuda_context_->ErrorCheck("cudaMemcpyAsync", cuda_result);
+    offset += e.tensor->size();
+  }
+
+}
+
+void CUDAAllgather::MemcpyOutFusionBuffer(const int64_t* const* entry_component_offsets,
+                        const int64_t* const* entry_component_sizes,
+                        const void* buffer_data, int element_size,
+                        std::vector<TensorTableEntry>& entries) {
+  // Copy memory out of the fusion buffer.
+  auto& first_entry = entries[0];
+  int global_size = global_state_->controller->GetSize();
+  for (size_t ec = 0; ec < entries.size(); ++ec) {
+    auto& e = entries[ec];
+    int64_t copy_offset = 0;
+    for (int rc = 0; rc < global_size; ++rc) {
+      int64_t entry_offset = entry_component_offsets[ec][rc] * element_size;
+      int64_t entry_size = entry_component_sizes[ec][rc] * element_size;
+      auto buffer_data_at_offset = (uint8_t*)buffer_data + entry_offset;
+      auto cuda_result = cudaMemcpyAsync((void*) e.output->data(), buffer_data_at_offset,
+                                     (size_t) entry_size, cudaMemcpyDeviceToDevice,
+                                     cuda_context_->streams[global_state_->current_nccl_stream][first_entry.device]);
+      cuda_context_->ErrorCheck("cudaMemcpyAsync", cuda_result);
+      copy_offset += entry_size;
+    }
+  }
+}
+
+void CUDAAllgather::InitCUDA(const std::vector<TensorTableEntry>& entries) {
+  auto& first_entry = entries[0];
+  cuda_context_->ErrorCheck("cudaSetDevice", cudaSetDevice(first_entry.device));
+
+  // Ensure stream is in the map before executing reduction.
+  cudaStream_t& stream = cuda_context_->streams[global_state_->current_nccl_stream][first_entry.device];
+  if (stream == nullptr) {
+    int greatest_priority;
+    cuda_context_->ErrorCheck("cudaDeviceGetStreamPriorityRange",
+                              cudaDeviceGetStreamPriorityRange(NULL, &greatest_priority));
+    cuda_context_->ErrorCheck("cudaStreamCreateWithPriority",
+                              cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest_priority));
+  }
+}
+
+void CUDAAllgather::InitCUDAQueue(const std::vector<TensorTableEntry>& entries, const Response& response) {
+  event_queue_ = std::queue<std::pair<std::string, cudaEvent_t>>();
+  stream_ = &cuda_context_->streams[global_state_->current_nccl_stream][entries[0].device];
+  host_buffer_ = nullptr;
+
+  if (global_state_->timeline.Initialized()) {
+    cuda_context_->RecordEvent(event_queue_, QUEUE, *stream_);
+  }
+}
+
+Status CUDAAllgather::FinalizeCUDAQueue(const std::vector<TensorTableEntry>& entries) {
+  // Use completion marker via event because it's faster than
+  // blocking cudaStreamSynchronize() in this thread.
+  cuda_context_->RecordEvent(event_queue_, "", *stream_);
+
+  auto& first_entry = entries[0];
+  void* host_buffer = host_buffer_;
+  auto& event_queue = event_queue_;
+  auto& timeline = global_state_->timeline;
+  auto& cuda_context = cuda_context_;
+
+  // Claim a std::shared_ptr to the fusion buffer to prevent its memory from being reclaimed
+  // during finalization.
+  auto fusion_buffer = global_state_->fusion_buffer.GetBuffer(
+      first_entry.device, first_entry.context->framework(), global_state_->current_nccl_stream);
+
+  // TODO: use thread pool or single thread for callbacks
+  std::thread finalizer_thread([entries, first_entry, host_buffer, fusion_buffer,
+                                event_queue, &timeline, &cuda_context]() mutable {
+    auto cuda_result = cudaSetDevice(first_entry.device);
+    cuda_context->ErrorCheck("cudaSetDevice", cuda_result);
+
+    cuda_context->WaitForEvents(event_queue, entries, timeline);
+    if (host_buffer != nullptr) {
+      free(host_buffer);
+    }
+
+    for (auto& e : entries) {
+      timeline.End(e.tensor_name, e.output);
+      e.callback(Status::OK());
+    }
+  });
+
+  finalizer_thread.detach();
+
+  // Update current stream
+  global_state_->current_nccl_stream = (global_state_->current_nccl_stream + 1) %
+                                  global_state_->num_nccl_streams;
+
+  return Status::InProgress();
+}
+
 } // namespace common
 } // namespace horovod

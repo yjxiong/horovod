@@ -138,8 +138,10 @@ void TensorUtil::Free(NDArray* tensor) { delete tensor; }
 // Resize tensor to nDimension with length size[i] in dimension i
 void TensorUtil::ResizeNd(NDArray* tensor, int nDimension, int64_t* size) {
   void* temp_out;
-  MXNDArrayReshape64(tensor, nDimension, size, false, &temp_out);
-  tensor = static_cast<NDArray*>(temp_out);
+  // MXNDArrayReshape64(tensor, nDimension, size, false, &temp_out);
+  // tensor = static_cast<NDArray*>(temp_out);
+  mxnet::Tuple<dim_t> shape(size, size+nDimension);
+  tensor->ReshapeAndAlloc(shape);
 }
 
 // Copy from tensor to output

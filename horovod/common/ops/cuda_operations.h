@@ -101,6 +101,48 @@ protected:
   struct CUDAContext* cuda_context_;
 };
 
+class CUDAAllgather : public AllgatherOp {
+public:
+  CUDAAllgather(CUDAContext* context,
+                HorovodGlobalState* global_state);
+
+  bool Enabled(const ParameterManager& param_manager,
+               const std::vector<TensorTableEntry>& entries,
+               const Response& response) const override;
+
+protected:
+  void MemcpyInFusionBuffer(const std::vector<TensorTableEntry>& entries,
+                       const int* displcmnts, int element_size,
+                       void*& buffer_data) override;
+
+  void MemcpyOutFusionBuffer(const int64_t* const* entry_component_offsets,
+                        const int64_t* const* entry_component_sizes,
+                        const void* buffer_data, int element_size,
+                        std::vector<TensorTableEntry>& entries) override;
+
+  void InitCUDA(const std::vector<TensorTableEntry>& entries);
+
+  void InitCUDAQueue(const std::vector<TensorTableEntry>& entries, const Response& response);
+
+  Status FinalizeCUDAQueue(const std::vector<TensorTableEntry>& entries);
+
+  // CUDA events are used as an alternative to host-device synchronization (which stalls the GPU pipeline)
+  // for the purpose of recording timing on the Horovod timeline.
+  //
+  // When an event we wish to record occurs (for example, NCCL_ALLREDUCE), the event is enqueued. After the entire
+  // operation completes, a background thread is spawned to synchronize on the events in the queue and record
+  // timing, while allowing Horovod to continue processing additional tensors.
+  //
+  // For more information of CUDA Events, see:
+  // https://devblogs.nvidia.com/how-implement-performance-metrics-cuda-cc/
+  std::queue<std::pair<std::string, cudaEvent_t>> event_queue_;
+
+  cudaStream_t* stream_;
+  void* host_buffer_;
+
+  struct CUDAContext* cuda_context_;
+};
+
 } // namespace common
 } // namespace horovod
 

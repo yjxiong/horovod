@@ -18,6 +18,7 @@
 #include "../common/operations.h"
 #include "cuda_util.h"
 #include "mpi_ops.h"
+#include "../common/logging.h"
 
 namespace horovod {
 namespace mxnet {
@@ -64,10 +65,25 @@ inline const char* GetOpTypeName(OperationType op_type) {
   }
 }
 
+void HorovodSynchronizer::MarkDone(){
+  {
+    std::unique_lock<std::mutex> lck(mtx_);
+    done_ = true;
+  }
+  cv_.notify_all();
+}
+
+bool HorovodSynchronizer::Wait(){
+  std::unique_lock<std::mutex> lck(mtx_);
+  while (! done_) cv_.wait(lck);
+  LOG(TRACE)<<"synchronizer wait completed";
+}
+
+
 void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
   ThrowIfError(common::CheckInitialized());
 
-  auto on_complete = *static_cast<CallbackOnComplete*>(on_complete_ptr);
+  auto mxnet_on_complete = *static_cast<CallbackOnComplete*>(on_complete_ptr);
   auto ops_param = static_cast<MpiOpsParam*>(param);
   auto tensor = ops_param->input;
   auto output = ops_param->output;
@@ -78,21 +94,24 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
   auto hvd_context = std::make_shared<MXOpContext<NDArray>>(device, output);
   std::shared_ptr<Tensor> hvd_output = nullptr;
 
+  auto sync = ops_param->sync_handle;
+
   Status enqueue_result;
   switch (ops_param->op_type) {
     case OperationType::ALLREDUCE:
       hvd_output = std::make_shared<MXTensor<NDArray>>(output);
       enqueue_result = EnqueueTensorAllreduce(
           hvd_context, hvd_tensor, hvd_output, nullptr, name, device,
-          [on_complete](const Status& status) {
-            InvokeCompleteCallback(on_complete, status);
+          [mxnet_on_complete, &sync](const Status& status) {
+            InvokeCompleteCallback(mxnet_on_complete, status);
       });
       break;
     case OperationType::ALLGATHER:
       enqueue_result = EnqueueTensorAllgather(
           hvd_context, hvd_tensor, nullptr, name, device,
-          [on_complete](const Status& status) {
-            InvokeCompleteCallback(on_complete, status);
+          [mxnet_on_complete, &sync](const Status& status) {
+            sync->MarkDone();
+            InvokeCompleteCallback(mxnet_on_complete, status);
       });
       break;
     case OperationType::BROADCAST:
@@ -107,14 +126,14 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
       enqueue_result = EnqueueTensorBroadcast(
           hvd_context, hvd_tensor, hvd_output, ops_param->root_rank,
           nullptr, name, device,
-          [on_complete](const Status& status) {
-            InvokeCompleteCallback(on_complete, status);
+          [mxnet_on_complete, &sync](const Status& status) {
+            // sync->MarkDone();
+            InvokeCompleteCallback(mxnet_on_complete, status);
       });
       break;
     default:
       throw std::logic_error("Unsupported Horovod operation type.");
   }
-
   ThrowIfError(enqueue_result);
 }
 
@@ -123,7 +142,10 @@ inline void PushHorovodOperation(OperationType op_type, NDArray* input,
                                  int priority, int root_rank = -1) {
   auto op_type_name = GetOpTypeName(op_type);
   auto op_name = GetOpName(op_type_name, name);
-  auto ops_param = CreateMpiOpsParam(input, output, nullptr, op_type, op_name, root_rank);
+
+  auto sync_handle = std::make_shared<HorovodSynchronizer>();
+
+  auto ops_param = CreateMpiOpsParam(input, output, nullptr, nullptr, op_type, op_name, root_rank, sync_handle);
 
   // Not in-place
   auto input_var = input->var();
@@ -138,6 +160,11 @@ inline void PushHorovodOperation(OperationType op_type, NDArray* input,
                       &MX_EXEC_CTX, nullptr, 0, &output_var, 1,
                       &MX_FUNC_PROP, priority, op_type_name);
   }
+
+  if (op_type == OperationType::ALLGATHER){
+    sync_handle->Wait();
+  }
+  
 }
 
 #if HAVE_CUDA
@@ -148,22 +175,26 @@ void DoHorovodOperationCudaOnCPU(void*, void* on_complete_ptr, void* param) {
   auto ops_param = static_cast<MpiOpsParam*>(param);
   auto name = ops_param->op_name;
   auto hvd_cpu_buffer = ops_param->cpu_tensor;
+  auto hvd_output_buffer = ops_param->output_tensor;
   auto hvd_context = std::make_shared<MXOpContext<NDArray>>(
-      CPU_DEVICE_ID, hvd_cpu_buffer->tensor());
+      CPU_DEVICE_ID, hvd_output_buffer->tensor());
+    
+  auto sync = ops_param->sync_handle;
 
   Status enqueue_result;
   switch (ops_param->op_type) {
     case OperationType::ALLREDUCE:
       enqueue_result = EnqueueTensorAllreduce(
           hvd_context, hvd_cpu_buffer, hvd_cpu_buffer, nullptr, name, CPU_DEVICE_ID,
-          [on_complete](const Status& status) {
+          [on_complete, &sync](const Status& status) {
             InvokeCompleteCallback(on_complete, status);
       });
       break;
     case OperationType::ALLGATHER:
       enqueue_result = EnqueueTensorAllgather(
           hvd_context, hvd_cpu_buffer, nullptr, name, CPU_DEVICE_ID,
-          [on_complete](const Status& status) {
+          [on_complete, &sync](const Status& status) {
+            sync->MarkDone();
             InvokeCompleteCallback(on_complete, status);
       });
       break;
@@ -171,14 +202,13 @@ void DoHorovodOperationCudaOnCPU(void*, void* on_complete_ptr, void* param) {
       enqueue_result = EnqueueTensorBroadcast(
           hvd_context, hvd_cpu_buffer, hvd_cpu_buffer, ops_param->root_rank,
           nullptr, name, CPU_DEVICE_ID,
-          [on_complete](const Status& status) {
+          [on_complete, &sync](const Status& status) {
             InvokeCompleteCallback(on_complete, status);
       });
       break;
     default:
       throw std::logic_error("Unsupported Horovod operation type.");
   }
-
   ThrowIfError(enqueue_result);
 }
 
@@ -189,20 +219,39 @@ inline void PushHorovodOperationCudaOnCPU(OperationType op_type, NDArray* input,
   auto op_name = GetOpName(op_type_name, name);
   auto hvd_cpu_buffer = std::make_shared<MXTemporaryBuffer<NDArray>>(
       CPU_DEVICE_ID, input->dtype());
-  auto ops_param = CreateMpiOpsParam(nullptr, nullptr, hvd_cpu_buffer,
-                                     op_type, op_name, root_rank);
+  auto hvd_output_buffer = std::make_shared<MXTemporaryBuffer<NDArray>>(
+        CPU_DEVICE_ID, input->dtype());
+  
+  auto sync_handle = std::make_shared<HorovodSynchronizer>();
+
+  auto ops_param = CreateMpiOpsParam(nullptr, nullptr, hvd_cpu_buffer, hvd_output_buffer,
+                                     op_type, op_name, root_rank, sync_handle);
 
   // Make async copy of input tensor to CPU tensor.
   TensorUtil::AsyncCopyCudaToCPU(input, hvd_cpu_buffer->tensor());
 
   // In-place
   auto cpu_tensor_var = hvd_cpu_buffer->tensor()->var();
+  auto output_tensor_var = hvd_output_buffer->tensor()->var();
+
+  std::vector<Engine::VarHandle> const_vars;
+  std::vector<Engine::VarHandle> mutable_vars;
+  mutable_vars.push_back(cpu_tensor_var);
+  mutable_vars.push_back(output_tensor_var);
+
   MXEnginePushAsync(DoHorovodOperationCudaOnCPU, ops_param, DeleteMpiOpsParam,
-                    &MX_EXEC_CTX, nullptr, 0, &cpu_tensor_var, 1,
+                    &MX_EXEC_CTX, nullptr, 0, mutable_vars.data(), 2,
                     &MX_FUNC_PROP, priority, op_type_name);
 
-  // Make async copy of CPU tensor to output tensor.
-  TensorUtil::AsyncCopyCPUToCuda(hvd_cpu_buffer->tensor(), output);
+  if (op_type == OperationType::ALLGATHER){
+    sync_handle->Wait();
+    TensorUtil::AsyncCopyCPUToCuda(hvd_output_buffer->tensor(), output);
+  }else{
+    // Make async copy of CPU tensor to output tensor.
+    // sync_handle->Wait();
+    TensorUtil::AsyncCopyCPUToCuda(hvd_cpu_buffer->tensor(), output);
+  }
+  
 }
 #endif
 

@@ -59,6 +59,27 @@ protected:
   ncclComm_t* nccl_comm_;
 };
 
+class NCCLAllgather : public CUDAAllgather {
+public:
+  NCCLAllgather(NCCLContext* nccl_context, CUDAContext* cuda_context,
+                HorovodGlobalState* global_state)
+      : CUDAAllgather(cuda_context, global_state),
+        nccl_context_(nccl_context){};
+
+  Status Execute(std::vector<TensorTableEntry>& entries,
+                 const Response& response) override;
+
+protected:
+  void InitNCCLComm(const std::vector<TensorTableEntry>& entries,
+                    const std::vector<int32_t>& nccl_device_map);
+
+  virtual void PopulateNCCLCommStrategy(int& nccl_rank, int& nccl_size,
+                                        Communicator& nccl_id_bcast_comm);
+
+  NCCLContext* nccl_context_;
+  ncclComm_t* nccl_comm_;
+};
+
 #if HAVE_MPI
 class NCCLHierarchicalAllreduce : public NCCLAllreduce {
 public:

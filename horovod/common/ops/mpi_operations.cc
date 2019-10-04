@@ -15,6 +15,7 @@
 // =============================================================================
 
 #include "mpi_operations.h"
+#include "../logging.h"
 
 namespace horovod {
 namespace common {
